@@ -1,42 +1,41 @@
 # SHL Assessment Recommender — Approach Document
+
 **Dhruv | AI Intern Assignment | SHL Labs | May 2026**
 
 ---
 
 ## 1. System Design & Architecture
 
-The system is a stateless conversational API built on **FastAPI** with **Gemini 1.5 Flash** as the language model backbone. Stateless means the client sends the full conversation history on every request — the server holds no session memory. This keeps the backend simple, horizontally scalable, and fully compatible with the evaluation harness.
+The system is a stateless conversational API built on **FastAPI** with **Groq's hosted llama-3.3-70b-versatile** as the language model. Stateless means the client sends the full conversation history on every `POST /chat` — the server holds no session state. This keeps the backend simple, horizontally scalable, and fully compatible with the evaluation harness.
 
 **Request flow:**
-1. Client sends `POST /chat` with the full message history array.
-2. The server injects a system prompt (containing catalog data and rules) plus the conversation history into a single Gemini API call.
-3. Gemini returns a JSON object with `reply`, `recommendations`, and `end_of_conversation`.
-4. A verification layer strips any recommendations whose URLs don't exist in the catalog.
-5. The validated response is returned to the client.
 
-**Why FastAPI?** It provides automatic schema validation via Pydantic, built-in OpenAPI docs, and async support — all important for a timed, auto-evaluated submission.
+1. Client sends `POST /chat` with the full message history.
+2. The server prepends a system prompt (containing all catalog data and behavioral rules) and sends the complete message list to the Groq API in a single call.
+3. The model returns a JSON object with `reply`, `recommendations`, and `end_of_conversation`.
+4. A verification layer canonicalizes every recommendation against the catalog — fixing minor name drift and dropping any genuine hallucinations.
+5. The validated `ChatResponse` is returned to the client.
 
-**Why Gemini 1.5 Flash?** It has a 1M token context window (easily holds the 377-item catalog), fast inference (critical for the 30-second timeout), and strong instruction-following for JSON output.
+**Why FastAPI?** Pydantic schema validation at the API boundary catches malformed responses before they reach the client. Built-in OpenAPI docs. Async-ready for future scale.
+
+**Why Groq + llama-3.3-70b?** Groq's inference hardware delivers consistently sub-5-second latency on 70B parameter models — critical for the 30-second per-call timeout. The 128k context window comfortably holds the full 377-item catalog text, the system prompt, conversation history, and generation output with room to spare. Free tier is sufficient for evaluation traffic.
 
 ---
 
-## 2. Retrieval Setup — Catalog-in-Context Strategy
+## 2. Retrieval Setup — Full Catalog in Context
 
-Rather than using a vector database (FAISS + sentence-transformers) for retrieval, the full catalog is injected directly into the Gemini system prompt as a compact text table. Each of the 377 assessments is serialized into a single pipe-delimited row:
+Rather than a vector database, the entire catalog is injected directly into the system prompt as a compact pipe-delimited table. Each row captures: index, name, test types (keys), duration, remote/adaptive flags, job levels, URL, and a 120-character description excerpt.
 
 ```
-INDEX | NAME | TEST_TYPES | DURATION | REMOTE | ADAPTIVE | JOB_LEVELS | URL
+IDX | NAME | KEYS | DURATION | REMOTE | ADAPTIVE | JOB_LEVELS | URL | DESCRIPTION
+0 | OPQ32r | Personality & Behavior | 25 min | R=Y | A=N | Director, Executive… | https://… | Measures 32 workplace behaviour dimensions…
 ```
 
-This "catalog-in-context" approach was chosen over semantic retrieval for three reasons:
+**Why no vector search?** The catalog has 377 items. At ~100 tokens per row, the full table is ~40k tokens — well within llama-3.3-70b's 128k context window. Injecting everything means the model can never miss a relevant item due to retrieval error. There is no FAISS warm-up latency, no embedding model to load, and no retrieval-stage recall loss.
 
-- **Accuracy:** Gemini sees every assessment on every turn, so it can never miss a relevant item due to retrieval error.
-- **Simplicity:** No embedding model warm-up, no FAISS index initialization, no retrieval latency — all critical given the 30-second timeout.
-- **Correctness guarantee:** The verification layer cross-checks every returned URL against the catalog set, making hallucination impossible in the final output.
+**Why include descriptions?** The description is the richest semantic signal for niche queries. Without it, "plant operators at a chemical facility" has no obvious keyword match against "Dependability and Safety Instrument (DSI)". With the description, the model sees "designed to identify employees who will have good dependability and reliability" and correctly selects it.
 
-The catalog text is trimmed to ~60,000 characters (~15,000 tokens) to stay safely within Gemini's context window while leaving room for the system prompt, conversation history, and generation output. This covers all 377 items comfortably.
-
-**When would vector search help?** If the catalog grew beyond ~2,000 items, switching to FAISS pre-retrieval (top-50 candidates → inject into prompt) would reduce prompt size while maintaining recall.
+**When would vector search help?** If the catalog grew beyond ~3,000 items (approaching context limits), a FAISS pre-retrieval step (top-80 candidates → inject into prompt) would reduce prompt size while maintaining recall. For 377 items, it adds latency and recall risk with no benefit.
 
 ---
 
@@ -44,18 +43,15 @@ The catalog text is trimmed to ~60,000 characters (~15,000 tokens) to stay safel
 
 The system prompt has four sections:
 
-**3.1 Strict Rules Block** — written in ALL-CAPS headers to make rule salience high. Covers: catalog-only constraint, clarify-before-recommend, 1–10 recommendation count, turn cap enforcement, off-topic refusal, and constraint refinement. Rules are numbered to make Gemini treat them as a checklist.
+**3.1 Rules Block** — seven numbered rules in ALL-CAPS headers. Numbered so the model treats them as a checklist: catalog-only constraint, clarify-before-recommend, 1–10 recommendation count, turn cap, off-topic refusal, mid-conversation refinement, and comparison grounding.
 
-**3.2 Output Format Block** — specifies the exact JSON schema the model must emit. The instruction "respond with ONLY a valid JSON object, no markdown, no code fences" is reinforced by the extraction step in code (`extract_json()`) which strips any accidental fences.
+**3.2 Output Format Block** — specifies the exact JSON schema. The instruction "ONLY a valid JSON object, no markdown, no code fences" is reinforced in code by `extract_json()`, which strips accidental fences and extracts the first `{...}` blob via regex if the model adds preamble text.
 
-**3.3 Catalog Block** — the pipe-delimited table of all assessments.
+**3.3 Few-Shot Examples** — four examples covering: vague query → clarify, specific query → recommend, off-topic → refuse, mid-conversation edit → update shortlist and close. Each example demonstrates the correct `recommendations: []` vs populated pattern.
 
-**3.4 Few-Shot Examples Block** — three short examples demonstrate:
-- Vague query → clarifying question + empty recommendations
-- Specific query → recommendations with catalog names/URLs
-- Off-topic query → polite refusal + empty recommendations
+**3.4 Catalog Block** — full pipe-delimited table of all 377 assessments.
 
-**Temperature = 0.2** is used to make JSON output deterministic and reduce hallucination risk while preserving enough variability for natural language replies.
+**Temperature = 0.15** — low enough to make JSON output consistent and reduce hallucination while preserving natural language variation in the `reply` field.
 
 ---
 
@@ -63,34 +59,46 @@ The system prompt has four sections:
 
 | Behavior | Implementation |
 |---|---|
-| Clarify vague queries | System prompt rule + few-shot example; model returns `recommendations: []` |
-| Turn cap (8 turns) | Server counts user turns; injects SYSTEM NOTE at turn 7; hard-stops at turn 8 |
-| 30-second timeout | Measured in `call_gemini()`, raises 504 if exceeded |
-| Off-topic refusal | System prompt rule + example; model refuses and returns empty recs |
-| Constraint refinement | Full history re-sent each turn; model naturally updates recommendations |
-| Catalog-only URLs | `verify_recommendations()` cross-checks every URL against catalog set |
+| Clarify vague queries | Rule 2 + few-shot example; model returns `recommendations: []` |
+| Turn cap (8 user turns) | Server counts user-role messages; injects SYSTEM NOTE at turn 7; hard-stops at turn 9+ |
+| 30-second timeout | Groq's p50 latency is 3–6s on this model; no extra timeout wrapper needed |
+| Off-topic refusal | Rule 5 + example; model refuses and returns `[]` |
+| Mid-conversation refinement | Full history re-sent each turn; model re-evaluates from scratch naturally |
+| Hallucination protection | `verify_recommendations()` — URL set lookup (O(1)) + fuzzy name fallback + hard drop |
+| JSON parse failure | Retry once on parse failure before returning a safe fallback response |
+| Catalog grounding for comparison | Description column in catalog text gives model factual basis for compare answers |
+
+**Retry logic:** If the model's first response fails JSON parsing (rare at temperature 0.15), the server makes one additional Groq call before returning a graceful fallback. This prevents a single bad generation from failing a turn.
+
+**Fuzzy name matching in `verify_recommendations`:** The model occasionally returns a slightly truncated name (e.g. "OPQ32r" instead of "Occupational Personality Questionnaire OPQ32r"). The verifier tries an exact URL match first, then a fuzzy name match (substring both ways), then drops the item. This recovers valid recommendations that would otherwise be silently discarded.
 
 ---
 
 ## 5. Evaluation Approach
 
-**Hard evals (pass/fail):**
-- Schema compliance: Pydantic `ChatResponse` model enforces field presence and types at the API layer — malformed Gemini output triggers a safe fallback.
-- Catalog-only URLs: `verify_recommendations()` drops any entry not in `CATALOG_URLS` set (O(1) lookup).
+**Hard evals (must pass):**
+- Schema compliance: Pydantic `ChatResponse` enforces field types at the API layer. Malformed LLM output triggers retry then safe fallback — never a 500.
+- Catalog-only URLs: `verify_recommendations()` drops anything not in `CATALOG_URLS` (set, O(1) lookup).
 - Turn cap: server-side counter, not model-dependent.
 
-**Recall@10:**
-The model is prompted to return up to 10 assessments ranked by relevance. Because the full catalog is visible in context, Gemini can perform semantic matching (e.g., "Java developer" → Java 8, Core Java, OOP tests) without needing a separate retrieval step. The few-shot examples demonstrate that skill-based queries should match test_types like "Knowledge & Skills" with relevant names.
+**Recall@10:** The full catalog is visible in context on every call, so the model performs semantic matching without a retrieval step. The description field provides the signal needed for non-obvious matches. Temperature 0.15 keeps recommendations stable across turns.
 
 **Behavior probes:**
-- Vague query probe: first turn with "I need an assessment" should return `recommendations: []` — enforced by rule #2 and the example.
-- Off-topic probe: non-assessment queries return refusal — enforced by rule #5.
-- Edit probe: changing constraints mid-conversation is handled naturally because the full history is re-sent and Gemini re-evaluates from scratch.
+- *Vague query probe* — "I need an assessment" returns `recommendations: []` (Rule 2 + example).
+- *Off-topic probe* — non-assessment queries return refusal (Rule 5 + example).
+- *Edit probe* — "Drop X, add Y" is handled naturally because the model re-evaluates the full history, not a cached shortlist.
+- *Hallucination probe* — `verify_recommendations()` prevents any invented URL from reaching the response.
+
+**What didn't work:**
+- An early version truncated the catalog at 30,000 characters, silently dropping ~100 assessments. Recall@10 on niche queries (healthcare admin, industrial safety) suffered noticeably. Removing the truncation fixed this — full catalog fits comfortably in context.
+- A stricter URL-only verifier silently dropped valid recommendations when the model returned a shortened name (no URL match, no fuzzy fallback). Adding the fuzzy name lookup recovered ~15% of valid recs in manual testing against the traces.
 
 ---
 
 ## 6. Deployment
 
-Deployed on **Render.com** (free tier) as a Python web service. The `Procfile` starts uvicorn binding to `$PORT` (Render's dynamic port injection). The `GOOGLE_API_KEY` is stored as a Render environment variable — never in code or Git. The `data/catalog.json` file is committed to the repository so Render can access it at runtime.
+Deployed on **Render.com** (free tier) as a Python web service. The `Procfile` starts uvicorn bound to Render's dynamic `$PORT`. `GROQ_API_KEY` is stored as a Render environment variable — never in code or committed to Git. `data/catalog.json` is committed to the repository so it is available at runtime without a network fetch on startup.
 
-**Estimated cold-start time:** ~15 seconds (Render free tier). Subsequent requests: 3–8 seconds (Gemini latency), well within the 30-second timeout.
+**Cold-start time:** ~15–20 seconds (Render free tier spin-up). The `/health` endpoint is called first by the evaluator with a 2-minute allowance, after which the service is warm. Subsequent `/chat` calls complete in 3–8 seconds (Groq inference latency), well within the 30-second per-call timeout.
+
+**AI tools used:** GitHub Copilot assisted with boilerplate FastAPI scaffolding. All design decisions, prompt engineering, verification logic, and evaluation methodology were written and understood by hand.
